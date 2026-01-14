@@ -48,6 +48,11 @@ const fixtures = [
   {expr: '10%6',        expected: 4},
   {expr: '"a"+"b"',     expected: 'ab'},
   {expr: 'one + three', expected: 4},
+  {expr: 'null ?? 1', expected: 1},
+  {expr: '3 ?? 1', expected: 3},
+  {expr: 'undefined ?? "defined"', expected: 'defined'},
+  {expr: '2**3', expected: 8},
+  {expr: '2**3**2', expected: 512}, // right associativity
 
   // call expression
   {expr: 'func(5)',   expected: 6},

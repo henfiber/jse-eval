@@ -54,9 +54,10 @@ export default class ExpressionEval {
     'TemplateLiteral': ExpressionEval.prototype.evalTemplateLiteral,
   };
 
-  // Default operator precedence from https://github.com/EricSmekens/jsep/blob/master/src/jsep.js#L55
+  // Default operator precedence from https://github.com/EricSmekens/jsep/blob/master/src/jsep.js#L937
   static DEFAULT_PRECEDENCE: Record<string, number> = {
     '||': 1,
+    '??': 1,
     '&&': 2,
     '|': 3,
     '^': 4,
@@ -76,11 +77,13 @@ export default class ExpressionEval {
     '-': 9,
     '*': 10,
     '/': 10,
-    '%': 10
+    '%': 10,
+    '**': 11,
   };
 
   static binops: Record<string, binaryCallback> = {
     '||': function (a, b) { return a || b; },
+    '??': function (a, b) { return a ?? b; },
     '&&': function (a, b) { return a && b; },
     '|': function (a, b) { return a | b; },
     '^': function (a, b) { return a ^ b; },
@@ -100,7 +103,8 @@ export default class ExpressionEval {
     '-': function (a, b) { return a - b; },
     '*': function (a, b) { return a * b; },
     '/': function (a, b) { return a / b; },
-    '%': function (a, b) { return a % b; }
+    '%': function (a, b) { return a % b; },
+    '**': function (a, b) { return a ** b; },
   };
 
   static unops: Record<string, unaryCallback> = {
