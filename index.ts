@@ -25,10 +25,22 @@ export type JseEvalPlugin = Partial<jsep.IPlugin> & {
   initEval?: (this: typeof ExpressionEval, jseEval: typeof ExpressionEval) => void;
 }
 
+
+const DEFERRED_NEW = Symbol('DEFERRED_NEW');
+interface DeferredNew {
+   [DEFERRED_NEW]: true;
+   value: any;
+}
+
 export default class ExpressionEval {
   static jsep = jsep;
   static parse = jsep;
   static evaluate = ExpressionEval.eval;
+
+  // static flag to toggle debug mode - disabled by default due to performance impact
+  // enables the _value property which allows code regeneration tools to utilize the intermediate values of each node
+  // see: https://github.com/6utt3rfly/jse-eval/commit/0a3067b8af107ae677bee55efd69995d15721dca
+  // static debugMode = false;
 
   static evaluators: Record<string, evaluatorCallback<AnyExpression>> = {
     'ArrayExpression': ExpressionEval.prototype.evalArrayExpression,
@@ -36,6 +48,7 @@ export default class ExpressionEval {
     'BinaryExpression': ExpressionEval.prototype.evalBinaryExpression,
     'CallExpression': ExpressionEval.prototype.evalCallExpression,
     'Compound': ExpressionEval.prototype.evalCompoundExpression,
+    'SequenceExpression': ExpressionEval.prototype.evalSequenceExpression,
     'ConditionalExpression': ExpressionEval.prototype.evalConditionalExpression,
     'Identifier': ExpressionEval.prototype.evalIdentifier,
     'Literal': ExpressionEval.evalLiteral,
@@ -205,20 +218,46 @@ export default class ExpressionEval {
   isAsync?: boolean;
 
   constructor(context?: Context, isAsync?: boolean) {
-    this.context = context;
+    this.context = context || Object.create(null);
     this.isAsync = isAsync;
   }
 
-  public eval(node: unknown, cb = v => v): unknown {
-    const evaluator = ExpressionEval.evaluators[(node as jsep.Expression).type]
-      || ExpressionEval.evaluators.default;
+  public eval(node: unknown, cb?: (v: unknown) => unknown): unknown {
+    if (!node) { return cb ? cb(undefined) : undefined; }
+    
+    // Fast-path for common leaf nodes to avoid function call overhead in tight loops (e.g. MemberExpression, BinaryExpression)
+    const type = (node as jsep.Expression).type;
+    if (type === 'Identifier') {
+      const val = this.context[(node as jsep.Identifier).name];
+      return cb ? cb(val) : val;
+    }
+    if (type === 'Literal') {
+      const val = (node as jsep.Literal).value;
+      return cb ? cb(val) : val;
+    }
+
+    const evaluator = ExpressionEval.evaluators[type] || ExpressionEval.evaluators.default;
     if (!evaluator) {
       throw new Error(`unknown node type: ${JSON.stringify(node, null, 2)}`);
     }
-    return this.evalSyncAsync(evaluator.bind(this)(node, this.context), (v) => {
-      (node as any)._value = v;
-      return cb(v);
-    });
+    // Use .call(this) instead of .bind(this) to avoid function allocation on every node
+    const res = evaluator.call(this, node, this.context);
+    
+    // Optim: Inline evalSyncAsync logic to avoid creating closure wrappers
+    if (this.isAsync) {
+      return Promise.resolve(res).then(cb);
+      // currently this feature is disabled due to performance impact - kept commented for future reference
+      // return Promise.resolve(res).then((val) => {
+      //   if (ExpressionEval.debugMode) { (node as any)._value = res; } 
+      //   return cb ? cb(val) : val;
+      // });
+    }
+
+    // currently this feature is disabled due to performance impact - kept commented for future reference
+    // if (ExpressionEval.debugMode) { (node as any)._value = res; }
+    
+    // Return direct result if no callback (common case for synchronous internal recursion)
+    return cb ? cb(res) : res;
   }
 
   /*
@@ -248,58 +287,151 @@ export default class ExpressionEval {
     return this.evalArray(node.elements);
   }
 
-  protected evalArray(list: jsep.Expression[]): unknown[] {
-    const mapped = list.map(v => this.eval(v));
-    const toFullArray = (res) => res
-      .reduce((arr, v, i) => {
+  protected evalArray(list: jsep.Expression[]): any {
+    // Pre-calculate mapped results using a for-loop to avoid creating map callbacks
+    const len = list.length;
+    if ( len === 0 ) { return []; }
+    const mapped: unknown[] = new Array(len);
+    for (let i = 0; i < len; i++) {
+      mapped[i] = this.eval(list[i]);
+    }
+    if (this.isAsync) {
+      return Promise.all(mapped).then(res => this.finishEvalArray(res, list));
+    }
+    return this.finishEvalArray(mapped, list);
+  }
+
+  private finishEvalArray(mapped: unknown[], list: jsep.Expression[]): unknown[] {
+    let hasSpread = (list as any)._hasSpread;
+    if (hasSpread === undefined) {
+      hasSpread = false;
+      for (let i = 0; i < list.length; i++) {
         if ((list[i] as AnyExpression).type === 'SpreadElement') {
-          return [...arr, ...v];
+          hasSpread = true;
+          break;
         }
-        arr.push(v);
+      }
+      (list as any)._hasSpread = hasSpread;
+    }
+
+    if (!hasSpread) return mapped;
+
+    return mapped.reduce((arr: unknown[], v, i) => {
+      if ((list[i] as AnyExpression).type === 'SpreadElement') {
+        if (Array.isArray(v)) {
+           arr.push(...v);
+        } else if (v != null && typeof (v as any)[Symbol.iterator] === 'function') {
+           // Fallback for generic iterables: spread by iterating
+           for (const item of v as any) {
+             arr.push(item);
+           }
+        } else {
+           // Non-iterable: push as single element to avoid runtime error
+           arr.push(v);
+        }
         return arr;
-      }, []);
-    return this.isAsync
-      ? Promise.all(mapped).then(toFullArray)
-      : toFullArray(mapped);
+      }
+      arr.push(v);
+      return arr;
+    }, []) as unknown[];
   }
 
   private evalBinaryExpression(node: jsep.BinaryExpression) {
-    if (node.operator === '||') {
-      return this.eval(node.left, left => left || this.eval(node.right));
-    } else if (node.operator === '&&') {
-      return this.eval(node.left, left => left && this.eval(node.right));
+    const op = node.operator;
+    // Optim: separate sync/async to avoid closures and array allocations
+    if (this.isAsync) {
+        if (op === '||') {
+            return this.eval(node.left, left => left || this.eval(node.right));
+        } else if (op === '&&') {
+            return this.eval(node.left, left => left && this.eval(node.right));
+        }
+        return Promise.all([this.eval(node.left), this.eval(node.right)])
+            .then(([left, right]) => ExpressionEval.binops[op](left, right));
     }
-    const leftRight = [
-      this.eval(node.left),
-      this.eval(node.right)
-    ];
-    const op = ([left, right]) => ExpressionEval
-      .binops[node.operator](left, right);
-    return this.isAsync
-      ? Promise.all(leftRight).then(op)
-      : op(leftRight as [operand, operand]);
+    
+    // Sync fast-path
+    // Standard always-present operators are handled inline
+    if (op === '===' || op === '==') {
+        const left = this.eval(node.left);
+        const right = this.eval(node.right); // no short-circuit in equality
+        return op === '===' ? left === right : left == right;
+    }
+
+    if (op === '||') {
+      const left = this.eval(node.left);
+      return left || this.eval(node.right);
+    }
+    if (op === '&&') {
+      const left = this.eval(node.left);
+      return left && this.eval(node.right);
+    }
+    
+    if (op === '!==' || op === '!=') {
+        const left = this.eval(node.left);
+        const right = this.eval(node.right);
+        return op === '!==' ? left !== right : left != right;
+    }
+
+    return ExpressionEval.binops[op](
+        this.eval(node.left), 
+        this.eval(node.right)
+    );
   }
 
   private evalCompoundExpression(node: jsep.Compound) {
-    return this.isAsync
-      ? node.body.reduce((p: Promise<any>, node) => p.then(() => this.eval(node)), Promise.resolve())
-      : node.body.map(v => this.eval(v))[node.body.length - 1]
+    if (this.isAsync) {
+      return node.body.reduce((p: Promise<any>, node) => p.then(() => this.eval(node)), Promise.resolve());
+    }
+    // Optim: Use loop to avoid allocating result array with .map()
+    const len = node.body.length;
+    for (let i = 0; i < len - 1; i++) {
+      this.eval(node.body[i]);
+    }
+    return this.eval(node.body[len - 1]);
+  }
+
+
+ /**
+  * Handling comma-separated expressions
+  *
+  *  allows to use assignments and multiple expressions in arrow functions
+  *  e.g.:  (x) => (a = x + 1, b = a * 2, b - 3)  // The last expression's value is returned.
+  *
+  *  Note: This is similar to CompoundExpression, but uses 'expressions' property.
+  */  
+  private evalSequenceExpression(node: jsep.SequenceExpression) {
+    if (this.isAsync) {
+      return node.expressions.reduce((p: Promise<any>, node) => p.then(() => this.eval(node)), Promise.resolve());
+    }
+    // Optim: Use loop to avoid allocating result array with .map()
+    const len = node.expressions.length;
+    for (let i = 0; i < len - 1; i++) {
+      this.eval(node.expressions[i]);
+    }
+    return this.eval(node.expressions[len - 1]);
   }
 
   private evalCallExpression(node: jsep.CallExpression) {
-    return this.evalSyncAsync(this.evalCall(node.callee), ([fn, caller]) => this
-      .evalSyncAsync(this.evalArray(node.arguments), args => fn
-        .apply(caller === node.callee ? this.context : caller, args)));
+    if (this.isAsync) {
+        return this.evalSyncAsync(this.evalCall(node.callee), ([fn, caller]) => this
+            .evalSyncAsync(this.evalArray(node.arguments), args => fn
+                .apply(caller === node.callee ? this.context : caller, args)));
+    }
+    // Sync fast-path
+    const [fn, caller] = this.evalCall(node.callee) as [Function, any];
+    const args = this.evalArray(node.arguments) as any[];
+    return fn.apply(caller === node.callee ? this.context : caller, args);
   }
 
   protected evalCall(callee: jsep.Expression): unknown {
-    if (callee.type === 'MemberExpression') {
+    if (callee?.type === 'MemberExpression') {
       return this.evalSyncAsync(
         this.evaluateMember(callee as jsep.MemberExpression),
         ([caller, fn]) => ExpressionEval.validateFnAndCall(fn, caller, callee as AnyExpression)
       );
     }
-    return this.eval(callee, fn => ExpressionEval.validateFnAndCall(fn, callee as AnyExpression));
+
+    return this.eval(callee, fn => ExpressionEval.validateFnAndCall(fn as () => unknown, callee as AnyExpression));
   }
 
   private evalConditionalExpression(node: jsep.ConditionalExpression) {
@@ -317,7 +449,31 @@ export default class ExpressionEval {
   }
 
   private evalMemberExpression(node: jsep.MemberExpression) {
-    return this.evalSyncAsync(this.evaluateMember(node), ([, val]) => val);
+    // Optim: Inline logic to avoid array allocation [obj, val, key] from evaluateMember
+    if (this.isAsync) {
+        return this.evalSyncAsync(this.evaluateMember(node), ([, val]) => val);
+    }
+
+    // Sync fast-path
+    const object: any = this.eval(node.object);
+    const key: string = node.computed ? this.eval(node.property) as string : (node.property as jsep.Identifier).name;
+
+    //Security check for fast-path
+    if ((key === '__proto__' || key === 'prototype' || key === 'constructor')) {
+         throw Error(`Access to member "${key}" disallowed.`);
+    }
+
+    // Handle DeferredNew: Propagate the deferral (inlined isDeferredNew check)
+    if (object && (object as any)[DEFERRED_NEW]) {
+        const val = (object as any).value?.[key];
+        return { [DEFERRED_NEW]: true, value: val };
+    }
+
+    // Optim: Avoid allocating {} for optional chaining
+    if (node.optional && object == null) {
+        return undefined;
+    }
+    return object[key];
   }
 
   private evaluateMember(node: jsep.MemberExpression) {
@@ -327,10 +483,13 @@ export default class ExpressionEval {
           ? this.eval(node.property)
           : (node.property as jsep.Identifier).name,
         (key: string) => {
-          if (/^__proto__|prototype|constructor$/.test(key)) {
+          if ((key === '__proto__' || key === 'prototype' || key === 'constructor')) {
             throw Error(`Access to member "${key}" disallowed.`);
           }
-          return [object, (node.optional ? (object || {}) : object)[key], key];
+          if (object && (object as any)[DEFERRED_NEW]) {
+             return [object, { [DEFERRED_NEW]: true, value: (object as any).value?.[key] }, key];
+          }
+          return [object, (node.optional ? (object || Object.create(null)) : object)[key], key];
         })
     );
   }
@@ -348,89 +507,180 @@ export default class ExpressionEval {
     if (this.isAsync !== node.async) {
       return ExpressionEval[node.async ? 'evalAsync' : 'eval'](node as any, this.context);
     }
+
+    // Note: Caching param mappers and complexity flag which speeds up loops or repeated calls
+    // The cache is stored on the node (AST) itself but it is a lexical definition (param names and types), 
+    // it does not capture runtime values. The params accept the `args` array (see the return statement) 
+    // as an argument at execution time.
+    const cachedMappers = (node as any)._paramMappers as (((ctx: any, args: any[], _eval: any) => void) | null)[] | undefined;
+    const paramMappers = cachedMappers ?? (
+      (node as any)._paramMappers = node.params?.map((param, i) => {
+        if (param.type === 'Identifier') {
+          const name = (param as jsep.Identifier).name;
+          return (ctx: any, args: any[], _eval: any) => {
+            ctx[name] = args[i];
+          };
+        }
+        if (param.type === 'SpreadElement') {
+          const arg = (param as SpreadElement).argument;
+          if (arg.type === 'Identifier') {
+            const name = (arg as jsep.Identifier).name;
+            return (ctx: any, args: any[], _eval: any) => {
+              ctx[name] = args.slice(i);
+            };
+          }
+        }
+        // Fallback for complex destructuring/defaults
+        return null;
+      })
+    );
+
+    const cachedHasComplex = (node as any)._hasComplexParams as boolean | undefined;
+    const hasComplexParams = cachedHasComplex ?? (
+      (node as any)._hasComplexParams = !paramMappers || paramMappers.some(m => !m)
+    );
+
+    // Optim: Avoid allocating new ExpressionEval instances for synchronous loops
+    if (!this.isAsync) {
+        // Capture context at definition time to allow lexical scoping (closures)
+        const definitionContext = this.context;
+        return (...arrowArgs: any[]) => {
+            // Optim: Use prototype chain instead of spread copy 
+            // Must inherit from definitionContext, not current execution context
+            const arrowContext = Object.create(definitionContext || null);
+            
+            // Swap context EARLY so that default parameter evaluation (if any) sets correctly
+            // and has access to the definition scope (and previous parameters)
+            const oldContext = this.context;
+            this.context = arrowContext;
+            try {
+                if (hasComplexParams) {
+                    // Slow path for complex params
+                    this.populateArrowContext(arrowContext, node, arrowArgs);
+                } else {
+                     // Fast path: direct assignment
+                     for (let i = 0; i < paramMappers.length; i++) {
+                         paramMappers[i](arrowContext, arrowArgs, this);
+                     }
+                }
+                return this.eval(node.body);
+            } finally {
+                this.context = oldContext;
+            }
+        };
+    }
+
+    const definitionContext = this.context;
     return (...arrowArgs) => {
-      const arrowContext = this.evalArrowContext(node, arrowArgs);
-      return ExpressionEval[node.async ? 'evalAsync' : 'eval'](node.body, arrowContext);
+      const arrowContext = Object.create(definitionContext || null);
+      
+      // Swap context for populateArrowContext (default params evaluation)
+      const oldContext = this.context;
+      this.context = arrowContext;
+      try {
+        if (hasComplexParams) {
+          this.populateArrowContext(arrowContext, node, arrowArgs);
+        } else {
+          for (let i = 0; i < paramMappers.length; i++) {
+              paramMappers[i](arrowContext, arrowArgs, null);
+          }
+        }
+      } finally {
+        this.context = oldContext;
+      }
+
+      return ExpressionEval.evalAsync(node.body, arrowContext);
     };
   }
 
-  private evalArrowContext(node: ArrowExpression, arrowArgs): Context {
-    const arrowContext = { ...this.context };
-
-    ((node.params as AnyExpression[]) || []).forEach((param, i) => {
-      // default value:
-      if (param.type === 'AssignmentExpression') {
-        if (arrowArgs[i] === undefined) {
-          arrowArgs[i] = this.eval(param.right);
+  // Renamed from evalArrowContext to populateArrowContext as it modifies in-place now
+  private populateArrowContext(arrowContext: Context, node: ArrowExpression, arrowArgs): void {
+    const params = (node.params as AnyExpression[]) || [];
+    
+    // Optim: Use for loop instead of forEach to avoid function allocation
+    for (let i = 0; i < params.length; i++) {
+        let param = params[i];
+        
+        // Handle spread element first as it consumes remaining args
+        if (param.type === 'SpreadElement') {
+             const arg = (param as SpreadElement).argument;
+             if (arg.type === 'Identifier') {
+                 arrowContext[(arg as jsep.Identifier).name] = arrowArgs.slice(i);
+             }
+             continue; 
         }
-        param = param.left as AnyExpression;
-      }
 
-      if (param.type === 'Identifier') {
-        arrowContext[(param as jsep.Identifier).name] = arrowArgs[i];
-      } else if (param.type === 'ArrayExpression') {
-        // array destructuring
-        (param.elements as AnyExpression[]).forEach((el, j) => {
-          let val = arrowArgs[i][j];
-          if (el.type === 'AssignmentExpression') {
-            if (val === undefined) {
-              // default value
-              val = this.eval(el.right);
-            }
-            el = el.left as AnyExpression;
-          }
+        let val = arrowArgs[i];
 
-          if (el.type === 'Identifier') {
-            arrowContext[(el as jsep.Identifier).name] = val;
-          } else {
-            throw new Error('Unexpected arrow function argument');
-          }
-        });
-      } else if (param.type === 'ObjectExpression') {
-        // object destructuring
-        const keys = [];
-        (param.properties as AnyExpression[]).forEach((prop) => {
-          let p = prop;
-          if (p.type === 'AssignmentExpression') {
-            p = p.left as AnyExpression;
-          }
+        // Handle Default Value (Assignment)
+        if (param.type === 'AssignmentExpression') {
+             if (val === undefined) {
+                 val = this.eval((param as AssignmentExpression).right);
+             }
+             param = (param as AssignmentExpression).left as AnyExpression;
+        }
 
-          let key;
-          if (p.type === 'Property') {
-            key = (<jsep.Expression>p.key).type === 'Identifier'
-              ? (p.key as jsep.Identifier).name
-              : this.eval(p.key).toString();
-          } else if (p.type === 'Identifier') {
-            key = p.name;
-          } else if (p.type === 'SpreadElement' && (<jsep.Expression>p.argument).type === 'Identifier') {
-            key = (p.argument as jsep.Identifier).name;
-          } else {
-            throw new Error('Unexpected arrow function argument');
-          }
-
-          let val = arrowArgs[i][key];
-          if (p.type === 'SpreadElement') {
-            // all remaining object properties. Copy arg obj, then delete from our copy
-            val = { ...arrowArgs[i] };
-            keys.forEach((k) => {
-              delete val[k];
+        // Now destruct 'val' into 'param'
+        if (param.type === 'Identifier') {
+            arrowContext[(param as jsep.Identifier).name] = val;
+        } else if (param.type === 'ArrayExpression') { 
+            // array destructuring using 'val'
+            (param.elements as AnyExpression[]).forEach((el, j) => {
+              let subVal = val[j]; 
+              if (el.type === 'AssignmentExpression') {
+                if (subVal === undefined) {
+                  // default value
+                  subVal = this.eval(el.right);
+                }
+                el = el.left as AnyExpression;
+              }
+    
+              if (el.type === 'Identifier') {
+                arrowContext[(el as jsep.Identifier).name] = subVal;
+              } else {
+                throw new Error('Unexpected arrow function argument');
+              }
             });
-          } else if (val === undefined && prop.type === 'AssignmentExpression') {
-            // default value
-            val = this.eval(prop.right);
-          }
-
-          arrowContext[key] = val;
-          keys.push(key);
-        });
-      } else if (param.type === 'SpreadElement' && (<jsep.Expression>param.argument).type === 'Identifier') {
-        const key = (param.argument as jsep.Identifier).name;
-        arrowContext[key] = arrowArgs.slice(i);
-      } else {
-        throw new Error('Unexpected arrow function argument');
-      }
-    });
-    return arrowContext;
+        } else if (param.type === 'ObjectExpression') {
+            // object destructuring using 'val'
+            const keys = [];
+            (param.properties as AnyExpression[]).forEach((prop) => {
+              let p = prop;
+              if (p.type === 'AssignmentExpression') {
+                p = p.left as AnyExpression;
+              }
+    
+              let key;
+              if (p.type === 'Property') {
+                key = (p.key as jsep.Expression).type === 'Identifier'
+                  ? (p.key as jsep.Identifier).name
+                  : this.eval(p.key).toString();
+              } else if (p.type === 'Identifier') {
+                key = p.name;
+              } else if (p.type === 'SpreadElement' && (p.argument as jsep.Expression).type === 'Identifier') {
+                key = (p.argument as jsep.Identifier).name;
+              } else {
+                throw new Error('Unexpected arrow function argument');
+              }
+    
+              let subVal = val[key]; 
+              
+              if (p.type === 'SpreadElement') {
+                // all remaining object properties. Copy arg obj, then delete from our copy
+                subVal = { ...val }; 
+                keys.forEach((k) => {
+                  delete subVal[k];
+                });
+              } else if (subVal === undefined && prop.type === 'AssignmentExpression') {
+                // default value
+                subVal = this.eval(prop.right);
+              }
+    
+              arrowContext[key] = subVal;
+              keys.push(key);
+            });
+        }
+    }
   }
 
   private evalAssignmentExpression(node: AssignmentExpression) {
@@ -467,7 +717,7 @@ export default class ExpressionEval {
   private getContextAndKey(node: AnyExpression) {
     if (node.type === 'MemberExpression') {
       return this.evalSyncAsync(
-        this.evaluateMember(<jsep.MemberExpression>node),
+        this.evaluateMember(node as jsep.MemberExpression),
         ([obj, , key]) => [obj, key]
       );
     } else if (node.type === 'Identifier') {
@@ -483,34 +733,80 @@ export default class ExpressionEval {
   }
 
   private evalNewExpression(node: NewExpression) {
+    const callee = node.callee || { type: 'Identifier', name: node.name } as jsep.Identifier;
+    // Check if callee resolves to a function. If not, and it's an object/namespace, return a DeferredNew wrapper.
+    // This handles the jsep-new-plugin confusing behavior on `new Namespace.Class()`.
+    
     return this.evalSyncAsync(
-      this.evalCall(node.callee),
-      ([ctor]) => this.evalSyncAsync(
-        this.evalArray(node.arguments),
-        args => ExpressionEval.construct(ctor, args, node)));
+        this.eval(callee),
+        (ctor) => {
+           if (typeof ctor !== 'function' && ctor && typeof ctor === 'object' && (!node.arguments || node.arguments.length === 0)) {
+               // Defer instantiation if not a function and no arguments were passed (typical namespace pattern)
+               return { [DEFERRED_NEW]: true, value: ctor };
+           }
+           return this.evalSyncAsync(
+                this.evalArray(node.arguments || []),
+                args => ExpressionEval.construct(ctor as any, args, node))
+        });
   }
 
   private evalObjectExpression(node: ObjectExpression) {
     const obj = {};
-    const arr = node.properties.map((prop: Property | SpreadElement) => {
-      if (prop.type === 'SpreadElement') {
-        // always synchronous in this case
-        Object.assign(obj, ExpressionEval.eval(prop.argument, this.context));
-      } else if (prop.type === 'Property') {
-        return this.evalSyncAsync(
-          prop.key.type === 'Identifier'
-            ? (<jsep.Identifier>prop.key).name
-            : this.eval(prop.key),
-          key => this.eval(
-            prop.shorthand ? prop.key : prop.value,
-            val => { obj[key] = val; }
-          )
-        );
+    if (this.isAsync) {
+        const props = node.properties;
+        const arr = new Array(props.length);
+        for (let i = 0; i < props.length; i++) {
+          const prop = props[i] as Property | SpreadElement;
+          if (prop.type === 'SpreadElement') {
+            arr[i] = Promise.resolve(this.eval(prop.argument))
+                .then(v => { Object.assign(obj, v); });
+          } else if (prop.type === 'Property') {
+            arr[i] = this.evalSyncAsync(
+              prop.key.type === 'Identifier' && !prop.computed
+                ? (prop.key as jsep.Identifier).name
+                : this.eval(prop.key),
+              key => this.eval(
+                prop.shorthand ? prop.key : prop.value,
+                val => { (obj as any)[key as string] = val; }
+              )
+            );
+          }
+        }
+        return Promise.all(arr).then(() => obj);
+    }
+
+    // Sync fast-path: use cached mappers to avoid repetitive AST traversal/checks
+    let mappers = (node as any)._objMappers;
+    if (!mappers) {
+      mappers = [];
+      for (let i = 0; i < node.properties.length; i++) {
+        const prop = node.properties[i] as (Property | SpreadElement);
+        if (prop.type === 'SpreadElement') {
+          const arg = prop.argument;
+          mappers.push((evaluator: ExpressionEval, o: any) => Object.assign(o, evaluator.eval(arg)));
+        } else if (prop.type === 'Property') {
+          const valNode = prop.shorthand ? prop.key : prop.value;
+          if (prop.key.type === 'Identifier' && !prop.computed) {
+            const key = (prop.key as jsep.Identifier).name;
+            mappers.push((evaluator: ExpressionEval, o: any) => {
+              o[key] = evaluator.eval(valNode);
+            });
+          } else {
+            const keyNode = prop.key;
+            mappers.push((evaluator: ExpressionEval, o: any) => {
+              const key = evaluator.eval(keyNode) as string | number;
+              o[key] = evaluator.eval(valNode);
+            });
+          }
+        }
       }
-    });
-    return this.isAsync
-      ? Promise.all(arr).then(() => obj)
-      : obj;
+      (node as any)._objMappers = mappers;
+    }
+
+    for (let i = 0; i < mappers.length; i++) {
+      mappers[i](this, obj);
+    }
+    return obj;
   }
 
   private evalSpreadElement(node: SpreadElement) {
@@ -560,15 +856,31 @@ export default class ExpressionEval {
   }
 
   protected static validateFnAndCall(
-    fn: () => unknown,
+    fn: (() => unknown) | DeferredNew,
     callee?: AnyExpression,
     caller?: AnyExpression,
   ): [() => unknown, AnyExpression] {
+    if (fn && (fn as any)[DEFERRED_NEW]) {
+        // Unwrap deferred new, if we are here it means we are trying to Call a DeferredNew, so we should Construct it instead.
+        const realFn = (fn as any).value;
+        if (typeof realFn === 'function') {
+            // Return a wrapper that forces construction using Reflect.construct (ignoring 'this'/caller)
+            // 'args' will be passed by evalCall's fn.apply(..., args)
+            return [ (...args: any[]) => Reflect.construct(realFn as Function, args), callee];
+        } else if (callee?.type === 'MemberExpression') {
+             // If we are here, `fn.value` is NOT a function.
+             // fall through
+        }
+        
+        // If unwrap is still not a function, fall through to error
+        return ExpressionEval.validateFnAndCall(realFn, callee, caller);
+    }
+    
     if (typeof fn !== 'function') {
       if (!fn && caller && caller.optional) {
         return [() => undefined, callee];
       }
-      const name = ExpressionEval.nodeFunctionName(caller || callee);
+      const name = ExpressionEval.nodeFunctionName(caller || callee) || 'unknown';
       throw new Error(`'${name}' is not a function`);
     }
     return [fn, callee];
