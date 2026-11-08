@@ -107,6 +107,25 @@ const fixtures = [
   {expr: 'xxx?.func("bar")', expected: undefined },
   {expr: 'string.slice(2)',  expected: 'ring'     },
 
+  // Optional access must preserve falsy primitives in both sync and async evaluation.
+  ...[0, false, '', NaN, 1, null, undefined].flatMap((value) => [
+    {expr: 'value?.toString', expected: value?.toString, context: { value }},
+    {expr: 'value?.["toString"]', expected: value?.['toString'], context: { value }},
+    {expr: 'value?.toString() ?? "fallback"', expected: value?.toString() ?? 'fallback', context: { value }},
+    {expr: 'value?.["toString"]() ?? "fallback"', expected: value?.['toString']() ?? 'fallback', context: { value }},
+  ]),
+  {expr: 'value?.length', expected: 0, context: { value: '' }},
+  {
+    expr: `ob = { result_agg: 0 };
+      res = {
+        "optional-chaining": ob.result_agg?.toFixed(3) ?? 'undefined',
+        "no-optional-chaining": ob.result_agg.toFixed(3) ?? 'undefined',
+      };
+      JSON.stringify(res);`,
+    expected: '{"optional-chaining":"0.000","no-optional-chaining":"0.000"}',
+    context: { JSON: { stringify: JSON.stringify } },
+  },
+
   // unary expression
   {expr: '-one',   expected: -1   },
   {expr: '+two',   expected: 2    },

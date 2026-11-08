@@ -489,7 +489,8 @@ export default class ExpressionEval {
           if (object && (object as any)[DEFERRED_NEW]) {
              return [object, { [DEFERRED_NEW]: true, value: (object as any).value?.[key] }, key];
           }
-          return [object, (node.optional ? (object || Object.create(null)) : object)[key], key];
+          // Optional access only substitutes nullish receivers, preserving falsy primitives.
+          return [object, (node.optional ? (object ?? Object.create(null)) : object)[key], key];
         })
     );
   }
